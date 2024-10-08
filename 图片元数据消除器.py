@@ -2,14 +2,14 @@ import sys
 import os
 import threading
 import requests
-import tempfile  # 新增
+import tempfile
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QPushButton,
     QFileDialog, QCheckBox, QLineEdit
 )
 from PyQt5.QtCore import (
     Qt, QMimeData, pyqtSignal, QObject, QByteArray, QBuffer,
-    QIODevice, QUrl
+    QIODevice, QUrl, QSettings
 )
 from PyQt5.QtGui import QPixmap, QImage, QIcon
 from PIL import Image
@@ -26,14 +26,39 @@ def resource_path(relative_path):
 
 class SignalEmitter(QObject):
     signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int, int)  # current, total
 
 class ImageProcessor(QWidget):
     def __init__(self):
         super().__init__()
+        self.settings = QSettings('CookSleep', 'ImageMetadataRemover')
+        self.save_directory = self.settings.value('save_directory', '', type=str)
+        self.save_checkbox_state = self.settings.value('save_checkbox_state', False, type=bool)
+        self.always_on_top_state = self.settings.value('always_on_top_state', False, type=bool)  # 加载“窗口置顶”状态
         self.initUI()
-        self.save_directory = ""
         self.save_option_checked_before = False
         self.temp_files = []  # 存储临时文件路径
+
+        # 设置复选框状态
+        self.save_checkbox.setChecked(self.save_checkbox_state)
+
+        # 根据复选框状态显示或隐藏目录输入框
+        if self.save_checkbox.isChecked():
+            self.dir_input.show()
+            self.dir_input.setText(self.save_directory)
+        else:
+            self.dir_input.hide()
+
+        # 设置“窗口置顶”复选框状态
+        self.always_on_top_checkbox.setChecked(self.always_on_top_state)
+        self.toggle_always_on_top(Qt.Checked if self.always_on_top_state else Qt.Unchecked)  # 设置窗口置顶属性
+
+        # 检查保存目录是否存在
+        if self.save_directory and not os.path.exists(self.save_directory):
+            self.label.setText('上次选择的保存目录不存在')
+            self.label.setStyleSheet('color: red;')
+        else:
+            self.label.setStyleSheet('')  # 重置样式
 
     def initUI(self):
         self.setWindowTitle('图片元数据消除器')
@@ -74,8 +99,10 @@ class ImageProcessor(QWidget):
         self.processed_images = []
         self.signal_emitter = SignalEmitter()
         self.signal_emitter.signal.connect(self.update_ui)
+        self.signal_emitter.progress_signal.connect(self.update_progress)  # 连接进度信号
 
     def toggle_always_on_top(self, state):
+        self.settings.setValue('always_on_top_state', state == Qt.Checked)  # 保存“窗口置顶”复选框状态
         if state == Qt.Checked:
             self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         else:
@@ -83,21 +110,23 @@ class ImageProcessor(QWidget):
         self.show()
 
     def toggle_save_option(self, state):
+        self.settings.setValue('save_checkbox_state', state == Qt.Checked)  # 保存复选框状态
         if state == Qt.Checked:
             self.dir_input.show()
             if not self.save_directory and not self.save_option_checked_before:
                 self.choose_directory()
                 self.save_option_checked_before = True
-            elif self.save_directory:
+            else:
                 self.dir_input.setText(self.save_directory)
         else:
             self.dir_input.hide()
 
     def choose_directory(self, event=None):
-        directory = QFileDialog.getExistingDirectory(self, '选择保存目录', os.getcwd())
+        directory = QFileDialog.getExistingDirectory(self, '选择保存目录', self.save_directory or os.getcwd())
         if directory:
             self.save_directory = directory
             self.dir_input.setText(self.save_directory)
+            self.settings.setValue('save_directory', self.save_directory)  # 保存目录到设置
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasImage() or event.mimeData().hasUrls():
@@ -121,25 +150,25 @@ class ImageProcessor(QWidget):
             self.image_data_list.append(('image', image))
         else:
             self.label.setText('不支持的文件类型')
+            self.label.setStyleSheet('color: red;')
             return
 
         if self.image_data_list:
-            self.label.setText('正在处理...')
             threading.Thread(target=self.process_images).start()
         else:
             self.label.setText('不支持的文件类型')
+            self.label.setStyleSheet('color: red;')
 
     def process_images(self):
+        if self.save_checkbox.isChecked():
+            if not self.save_directory or not os.path.exists(self.save_directory):
+                self.signal_emitter.signal.emit('保存目录不存在')
+                return
         self.processed_images = []
-        threads = []
-        for data_type, data in self.image_data_list:
-            thread = threading.Thread(target=self.remove_metadata, args=(data_type, data))
-            threads.append(thread)
-            thread.start()
-
-        for thread in threads:
-            thread.join()
-
+        total = len(self.image_data_list)
+        for index, (data_type, data) in enumerate(self.image_data_list, start=1):
+            self.signal_emitter.progress_signal.emit(index, total)
+            self.remove_metadata(data_type, data)
         self.signal_emitter.signal.emit('处理完成')
 
     def remove_metadata(self, data_type, data):
@@ -217,8 +246,18 @@ class ImageProcessor(QWidget):
         except Exception as e:
             print(f'处理文件出错: {e}')
 
+    def update_progress(self, current, total):
+        self.label.setText(f'正在处理... ({current}/{total})')
+        self.label.setStyleSheet('color: black;')
+
     def update_ui(self, message):
         self.label.setText(message)
+        if message == '处理完成':
+            self.label.setStyleSheet('color: green;')
+        elif message == '保存目录不存在':
+            self.label.setStyleSheet('color: red;')
+        else:
+            self.label.setStyleSheet('')  # 重置样式
 
     def copy_results(self):
         if self.processed_images:
@@ -228,8 +267,10 @@ class ImageProcessor(QWidget):
             mime_data.setUrls(urls)
             clipboard.setMimeData(mime_data)
             self.label.setText('已复制处理结果')
+            self.label.setStyleSheet('color: green;')
         else:
             self.label.setText('没有可复制的内容')
+            self.label.setStyleSheet('color: red;')
 
     def closeEvent(self, event):
         # 删除临时文件
