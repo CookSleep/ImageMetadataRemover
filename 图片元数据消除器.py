@@ -58,6 +58,7 @@ class ImageProcessor(QWidget):
             self.label.setText('上次选择的保存目录不存在')
             self.label.setStyleSheet('color: red;')
         else:
+            self.label.setText('将图片拖拽到此窗口')  # 恢复默认提示信息
             self.label.setStyleSheet('')  # 重置样式
 
     def initUI(self):
@@ -127,6 +128,10 @@ class ImageProcessor(QWidget):
             self.save_directory = directory
             self.dir_input.setText(self.save_directory)
             self.settings.setValue('save_directory', self.save_directory)  # 保存目录到设置
+
+            # 恢复默认提示信息和样式
+            self.label.setText('将图片拖拽到此窗口')
+            self.label.setStyleSheet('')  # 重置样式
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasImage() or event.mimeData().hasUrls():
