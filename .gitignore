@@ -1,0 +1,17 @@
+# PyInstaller
+/dist/
+/build/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+venv/
+env/
+
+# User specified
+/测试/
+list_chunks.py

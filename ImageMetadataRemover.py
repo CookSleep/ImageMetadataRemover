@@ -3,7 +3,7 @@ import os
 import tempfile
 import shutil
 import piexif
-import requests
+from urllib import request
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 from PyQt5.QtWidgets import (
@@ -21,12 +21,13 @@ import io
 @dataclass
 class ImageTask:
     """图片处理任务"""
-    def __init__(self, index: int, data_type: str, data: str, save_path: str = None, original_name: str = None):
+    def __init__(self, index: int, data_type: str, data: str, save_path: str = None, original_name: str = None, remove_alpha: bool = False):
         self.index = index
         self.data_type = data_type
         self.data = data
         self.save_path = save_path
         self.original_name = original_name
+        self.remove_alpha = remove_alpha
         self.result = None
         self.error = None
 
@@ -46,7 +47,7 @@ class ImageWorker(QRunnable):
     def run(self):
         try:
             if self.task.data_type == 'file':
-                success = remove_exif(self.task.data, self.task.save_path)
+                success = remove_exif(self.task.data, self.task.save_path, self.task.remove_alpha)
             else:
                 # 对于非文件类型，先保存为临时文件
                 temp_buffer = tempfile.NamedTemporaryFile(delete=False)
@@ -56,11 +57,11 @@ class ImageWorker(QRunnable):
                     self.task.data.save(buffer, "PNG")
                     temp_buffer.write(buffer.data())
                 else:  # URL
-                    response = requests.get(self.task.data)
-                    temp_buffer.write(response.content)
+                    with request.urlopen(self.task.data) as response:
+                        temp_buffer.write(response.read())
                 temp_buffer.close()
                 
-                success = remove_exif(temp_buffer.name, self.task.save_path)
+                success = remove_exif(temp_buffer.name, self.task.save_path, self.task.remove_alpha)
                 os.unlink(temp_buffer.name)
             
             if not success:
@@ -84,6 +85,8 @@ class ImageProcessor(QWidget):
         self.save_directory = self.settings.value('save_directory', '', type=str)
         self.save_checkbox_state = self.settings.value('save_checkbox_state', False, type=bool)
         self.always_on_top_state = self.settings.value('always_on_top_state', False, type=bool)
+        
+        self.remove_alpha_state = self.settings.value('remove_alpha_state', False, type=bool)
         
         # 初始化线程池
         self.threadpool = QThreadPool()
@@ -114,6 +117,9 @@ class ImageProcessor(QWidget):
         self.always_on_top_checkbox.setChecked(self.always_on_top_state)
         self.toggle_always_on_top(Qt.Checked if self.always_on_top_state else Qt.Unchecked)
         
+        # 设置"删除Alpha通道"复选框状态
+        self.remove_alpha_checkbox.setChecked(self.remove_alpha_state)
+
         # 检查保存目录状态并设置提示信息
         self.update_directory_status()
 
@@ -144,6 +150,11 @@ class ImageProcessor(QWidget):
         self.copy_button = QPushButton('复制')
         self.copy_button.clicked.connect(self.copy_results)
         self.layout.addWidget(self.copy_button)
+
+        # 新增的删除Alpha通道功能
+        self.remove_alpha_checkbox = QCheckBox('删除Alpha通道')
+        self.remove_alpha_checkbox.stateChanged.connect(self.toggle_remove_alpha)
+        self.layout.addWidget(self.remove_alpha_checkbox)
 
         # 新增的窗口置顶功能
         self.always_on_top_checkbox = QCheckBox('窗口置顶')
@@ -212,6 +223,9 @@ class ImageProcessor(QWidget):
             
             # 清空错误列表
             self.errors.clear()
+
+    def toggle_remove_alpha(self, state):
+        self.settings.setValue('remove_alpha_state', state == Qt.Checked)
 
     def toggle_always_on_top(self, state):
         self.settings.setValue('always_on_top_state', state == Qt.Checked)  # 保存“窗口置顶”复选框状态
@@ -393,6 +407,7 @@ class ImageProcessor(QWidget):
         self.settings.setValue('save_directory', self.save_directory)
         self.settings.setValue('save_checkbox_state', self.save_checkbox.isChecked())
         self.settings.setValue('always_on_top_state', self.always_on_top_checkbox.isChecked())
+        self.settings.setValue('remove_alpha_state', self.remove_alpha_checkbox.isChecked())
         
         # 清理临时文件
         for temp_file in self.temp_files:
@@ -441,7 +456,8 @@ class ImageProcessor(QWidget):
                     self.temp_files.append(tmp.name)
 
             # 创建任务
-            task = ImageTask(i, data_type, data, save_path, original_name)
+            remove_alpha = self.remove_alpha_checkbox.isChecked()
+            task = ImageTask(i, data_type, data, save_path, original_name, remove_alpha)
             worker = ImageWorker(task)
             worker.signals.finished.connect(self.handle_worker_finished)
             worker.signals.error.connect(self.handle_worker_error)
@@ -449,52 +465,79 @@ class ImageProcessor(QWidget):
 
         self.update_progress(0, self.total_tasks)
 
-def remove_exif(src_path, dst_path):
-    """直接移除图片的元数据，不重新编码图片内容"""
+def remove_exif(src_path, dst_path, remove_alpha=False):
+    """移除图片的元数据，并可选择移除Alpha通道。"""
     try:
-        # 先尝试用 PIL 检查图片格式
         with Image.open(src_path) as img:
-            format = img.format.upper()
+            # 如果请求移除Alpha通道，这将是主要路径，因为必须重新编码图像。
+            if remove_alpha:
+                img_to_save = None
+                if img.mode in ('RGBA', 'LA'):
+                    img_to_save = img.convert('RGB' if img.mode == 'RGBA' else 'L')
+                elif img.mode == 'P' and 'transparency' in img.info:
+                    img_to_save = img.convert('RGBA').convert('RGB')
+
+                if img_to_save:
+                    # 保存转换后的图像。Pillow在保存时会去除元数据。
+                    img_to_save.save(dst_path, format=img.format)
+                    return True
+                # 如果没有找到Alpha通道，则继续执行下面的标准元数据移除流程。
+
+            # --- 标准元数据移除流程 ---
+            img_format = img.format.upper()
             
-            # 对于 JPEG/WEBP 使用 piexif
-            if format in ['JPEG', 'WEBP']:
+            if img_format in ['JPEG', 'WEBP']:
                 try:
                     piexif.remove(src_path, dst_path)
                     return True
-                except Exception as e:
-                    raise Exception(f"处理 {format} 格式时出错: {str(e)}")
+                except Exception:
+                    # 如果piexif失败，回退到重新保存
+                    img.save(dst_path, format=img.format)
+                    return True
             
-            # 对于 PNG 格式
-            elif format == 'PNG':
+            elif img_format == 'PNG':
                 try:
-                    with open(src_path, 'rb') as src:
-                        data = src.read()
-                        if data.startswith(b'\x89PNG\r\n\x1a\n'):
-                            pos = 8
-                            chunks = []
-                            while pos < len(data):
-                                length = int.from_bytes(data[pos:pos+4], 'big')
-                                chunk_type = data[pos+4:pos+8]
-                                if chunk_type not in [b'tEXt', b'iTXt', b'zTXt']:
-                                    chunks.append(data[pos:pos+length+12])
-                                pos += length + 12
-                            
-                            with open(dst_path, 'wb') as dst:
-                                dst.write(data[:8])
-                                for chunk in chunks:
-                                    dst.write(chunk)
-                            return True
+                    chunks_to_keep = [
+                        b'IHDR', b'PLTE', b'IDAT', b'IEND',
+                        b'sRGB', b'gAMA', b'pHYs', b'cHRM',
+                        b'tRNS', b'bKGD', b'iCCP'
+                    ]
+                    
+                    with open(src_path, 'rb') as src_file:
+                        data = src_file.read()
+                    
+                    if not data.startswith(b'\x89PNG\r\n\x1a\n'):
+                        raise Exception("无效的PNG文件（缺少签名）。")
+
+                    new_png_data = bytearray()
+                    new_png_data.extend(data[:8])
+
+                    pos = 8
+                    while pos < len(data):
+                        length = int.from_bytes(data[pos:pos+4], 'big')
+                        chunk_type = data[pos+4:pos+8]
+                        
+                        if chunk_type in chunks_to_keep:
+                            new_png_data.extend(data[pos : pos + 12 + length])
+                        
+                        pos += (12 + length)
+                        
+                        if chunk_type == b'IEND':
+                            break
+                    
+                    with open(dst_path, 'wb') as dst_file:
+                        dst_file.write(new_png_data)
+                    return True
                 except Exception as e:
                     raise Exception(f"处理 PNG 格式时出错: {str(e)}")
             
-            # 对于其他格式，复制图像数据到新图片
-            try:
-                new_img = Image.new(img.mode, img.size)
-                new_img.putdata(list(img.getdata()))
-                new_img.save(dst_path, format=format)
-                return True
-            except Exception as e:
-                raise Exception(f"处理 {format} 格式图像时出错: {str(e)}")
+            # 对于其他格式
+            else:
+                try:
+                    img.save(dst_path, format=img.format)
+                    return True
+                except Exception as e:
+                    raise Exception(f"处理 {img_format} 格式图像时出错: {str(e)}")
                 
     except Exception as e:
         raise Exception(str(e))
